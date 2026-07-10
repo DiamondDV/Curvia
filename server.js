@@ -10,8 +10,10 @@ app.use(
   cors({
     origin: [
       "http://localhost:5173",
-      "https://YOUR-FRONTEND.onrender.com",
+      "https://curvia-front.onrender.com",
     ],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 

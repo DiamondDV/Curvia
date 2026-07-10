@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import cors from "cors";
 import { createProxyMiddleware } from "http-proxy-middleware";
@@ -6,21 +5,51 @@ import "dotenv/config";
 
 const app = express();
 
-app.use(cors());
+// Allow your frontend to call the API
+app.use(
+  cors({
+    origin: [
+      "http://localhost:5173",
+      "https://YOUR-FRONTEND.onrender.com",
+    ],
+  })
+);
+
 app.use(express.json({ limit: "30mb" }));
 
 const POLLINATIONS_KEY = process.env.POLLINATIONS_KEY;
 const GEMINI_KEY = process.env.GEMINI_KEY;
 const PORT = process.env.PORT || 3001;
 
-// =========================
-// Pollinations Text-to-Image
-// =========================
+// ============================
+// Home
+// ============================
+
+app.get("/", (req, res) => {
+  res.send("✅ Curvia API is running!");
+});
+
+// ============================
+// Health
+// ============================
+
+app.get("/api/health", (req, res) => {
+  res.json({
+    ok: true,
+    pollinations: Boolean(POLLINATIONS_KEY),
+    gemini: Boolean(GEMINI_KEY),
+  });
+});
+
+// ============================
+// Pollinations - Text to Image
+// ============================
+
 app.post("/api/flux", async (req, res) => {
   if (!POLLINATIONS_KEY) {
-    return res.status(503).json({
-      error: "POLLINATIONS_KEY not configured",
-    });
+    return res
+      .status(503)
+      .json({ error: "POLLINATIONS_KEY not configured" });
   }
 
   try {
@@ -36,13 +65,18 @@ app.post("/api/flux", async (req, res) => {
       }
     );
 
-    const text = await upstream.text();
+    const contentType =
+      upstream.headers.get("content-type") || "application/json";
 
     res.status(upstream.status);
-    res.setHeader(
-      "Content-Type",
-      upstream.headers.get("content-type") || "application/json"
-    );
+    res.setHeader("Content-Type", contentType);
+
+    if (contentType.startsWith("image/")) {
+      const arrayBuffer = await upstream.arrayBuffer();
+      return res.send(Buffer.from(arrayBuffer));
+    }
+
+    const text = await upstream.text();
     res.send(text);
   } catch (err) {
     console.error(err);
@@ -52,9 +86,10 @@ app.post("/api/flux", async (req, res) => {
   }
 });
 
-// =========================
-// Pollinations Image Edit
-// =========================
+// ============================
+// Pollinations - Image Edit
+// ============================
+
 app.use(
   "/api/image-edit",
   createProxyMiddleware({
@@ -76,9 +111,10 @@ app.use(
   })
 );
 
-// =========================
+// ============================
 // Gemini
-// =========================
+// ============================
+
 app.post("/api/gemini", async (req, res) => {
   if (!GEMINI_KEY) {
     return res.status(503).json({
@@ -105,6 +141,7 @@ app.post("/api/gemini", async (req, res) => {
       "Content-Type",
       upstream.headers.get("content-type") || "application/json"
     );
+
     res.send(text);
   } catch (err) {
     console.error(err);
@@ -114,28 +151,18 @@ app.post("/api/gemini", async (req, res) => {
   }
 });
 
-// =========================
-// Health Check
-// =========================
-app.get("/api/health", (_req, res) => {
-  res.json({
-    ok: true,
-    pollinations: Boolean(POLLINATIONS_KEY),
-    gemini: Boolean(GEMINI_KEY),
-  });
-});
-
-// =========================
+// ============================
 // Start Server
-// =========================
+// ============================
+
 app.listen(PORT, () => {
-  console.log(`Curvia backend running on http://localhost:${PORT}`);
+  console.log(`🚀 Curvia backend running on port ${PORT}`);
 
   if (!POLLINATIONS_KEY) {
-    console.warn("⚠ POLLINATIONS_KEY is not configured");
+    console.warn("⚠ POLLINATIONS_KEY is NOT configured.");
   }
 
   if (!GEMINI_KEY) {
-    console.warn("⚠ GEMINI_KEY is not configured");
+    console.warn("⚠ GEMINI_KEY is NOT configured.");
   }
 });

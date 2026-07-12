@@ -1,0 +1,11 @@
+services:
+  curvia:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - TEMP_DIR=/tmp
+      - MAX_CONCURRENT_JOBS=20
+    restart: unless-stopped

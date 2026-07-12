@@ -1,0 +1,43 @@
+{
+  "name": "curvia",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "node server.js",
+    "lint": "eslint .",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:golden": "vitest run tests/golden"
+  },
+  "dependencies": {
+    "next": "15.0.0",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "sharp": "0.33.5",
+    "quantize": "1.0.2",
+    "svgo": "3.3.2",
+    "framer-motion": "11.3.0",
+    "@rgrove/parse-xml": "4.1.0",
+    "clsx": "2.1.1",
+    "tailwind-merge": "2.3.0"
+  },
+  "devDependencies": {
+    "typescript": "5.5.4",
+    "@types/node": "20.14.0",
+    "@types/react": "19.0.0",
+    "@types/react-dom": "19.0.0",
+    "@types/quantize": "1.0.2",
+    "tailwindcss": "^4.1.0",
+    "@tailwindcss/postcss": "^4.1.0",
+    "postcss": "8.4.39",
+    "autoprefixer": "10.4.19",
+    "eslint": "9.7.0",
+    "eslint-config-next": "15.0.0",
+    "vitest": "2.0.0"
+  }
+}

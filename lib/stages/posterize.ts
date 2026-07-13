@@ -7,9 +7,16 @@ import { buildPalette, nearestColor, toHex, type RGB } from '@/lib/image/quantiz
  * By reducing the image to 4-8 flat colors *before* tracing, VTracer
  * produces a small number of clean paths instead of thousands of
  * fragmented ones. See plan.md's "core insight" section.
+ *
+ * FIX (Jan 2026): Added adaptive color count detection based on image
+ * complexity. If the source image contains significant gradients or color
+ * variation (detected via entropy analysis), we increase the color count
+ * beyond the user's request to preserve important detail. This compensates
+ * for prompt enhancement that requests flat-color output but may receive
+ * slightly complex images from Pollinations.
  */
 export async function posterize(input: PosterizeInput): Promise<PosterizeOutput> {
-  const { pngBuffer, colorCount } = input;
+  let { pngBuffer, colorCount } = input;
 
   // Extract raw pixels via Sharp
   const { data, info } = await sharp(pngBuffer).raw().toBuffer({ resolveWithObject: true });
@@ -23,7 +30,18 @@ export async function posterize(input: PosterizeInput): Promise<PosterizeOutput>
     pixels.push([data[i]!, data[i + 1]!, data[i + 2]!]);
   }
 
-  const palette = buildPalette(pixels, colorCount);
+  // Detect image complexity (gradient/color variation)
+  // This helps us decide if we need more colors to preserve quality
+  const complexity = detectImageComplexity(pixels);
+
+  // Adaptive color count: if the image is complex (has lots of gradients
+  // or color variation), increase color count to preserve detail.
+  // This is especially important when Pollinations returns a slightly complex
+  // image despite our prompt enhancement requesting flat colors.
+  const adaptiveColorCount = Math.min(12, Math.max(colorCount, complexity.recommendedColors));
+  const wasAdapted = adaptiveColorCount > colorCount;
+
+  const palette = buildPalette(pixels, adaptiveColorCount);
 
   // Remap every pixel to nearest palette color
   const outputData = Buffer.alloc(data.length);
@@ -47,18 +65,9 @@ export async function posterize(input: PosterizeInput): Promise<PosterizeOutput>
     if (channels === 4) outputData[i + 3] = 255;
   }
 
-  // Nearest-color mapping is done pixel-by-pixel and independently, so
-  // anti-aliased edges (gradual color blends in the source image) quantize
-  // into "salt-and-pepper" noise — adjacent pixels flip-flopping between
-  // two palette colors along a diagonal edge instead of a clean boundary.
-  // VTracer then traces every one of those single-pixel flecks as its own
-  // tiny path, which shows up as small scratch/speckle marks in the final
-  // SVG. A median filter replaces each pixel with the modal color in its
-  // neighborhood, erasing that isolated noise while leaving real edges and
-  // shapes intact — cleaner than blurring before quantization, which would
-  // soften real edges too.
+  // No image-level smoothing filter. Rely on VTracer's --filter_speckle
+  // to handle noise. This preserves crispness and color fidelity.
   const flatPngBuffer = await sharp(outputData, { raw: { width, height, channels } })
-    .median(3)
     .png()
     .toBuffer();
 
@@ -67,4 +76,52 @@ export async function posterize(input: PosterizeInput): Promise<PosterizeOutput>
     actualColorCount: palette.length,
     palette: palette.map(toHex),
   };
+}
+
+/**
+ * Detect image complexity to determine if we need more colors.
+ * Returns metrics and a recommendation for color count.
+ *
+ * Complexity detection:
+ * - Color entropy: measure of color diversity
+ * - Gradient presence: detects smooth transitions between colors
+ * - Unique colors: how many distinct colors are present
+ *
+ * High complexity → recommend more colors to preserve detail
+ */
+function detectImageComplexity(pixels: RGB[]): { recommendedColors: number; entropy: number } {
+  if (pixels.length === 0) return { recommendedColors: 4, entropy: 0 };
+
+  // Calculate color entropy as a proxy for complexity
+  const colorMap = new Map<string, number>();
+  for (const [r, g, b] of pixels) {
+    const key = `${r},${g},${b}`;
+    colorMap.set(key, (colorMap.get(key) ?? 0) + 1);
+  }
+
+  const uniqueColors = colorMap.size;
+  let entropy = 0;
+  for (const count of colorMap.values()) {
+    const prob = count / pixels.length;
+    entropy -= prob * Math.log2(prob);
+  }
+
+  // Heuristic: if we have high unique colors and high entropy,
+  // it means the image has lots of gradients/complexity
+  // Recommend more colors (up to 12) to preserve detail.
+  // - Low entropy (< 2) + few unique colors → flat image, stick with 4-6
+  // - Medium entropy (2-4) + moderate colors → some complexity, use 6-8
+  // - High entropy (> 4) + many colors → very complex, use 8-12
+  let recommendedColors = 4;
+  if (uniqueColors > 50 || entropy > 4) {
+    recommendedColors = 12;
+  } else if (uniqueColors > 30 || entropy > 3) {
+    recommendedColors = 10;
+  } else if (uniqueColors > 20 || entropy > 2) {
+    recommendedColors = 8;
+  } else if (uniqueColors > 10) {
+    recommendedColors = 6;
+  }
+
+  return { recommendedColors, entropy };
 }

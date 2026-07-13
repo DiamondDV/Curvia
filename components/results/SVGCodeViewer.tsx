@@ -16,15 +16,15 @@ export function SVGCodeViewer({ svg }: SVGCodeViewerProps) {
   };
 
   return (
-    <div className="relative rounded-xl border border-zinc-800 bg-zinc-950">
+    <div className="relative h-full w-full overflow-hidden rounded-lg border border-zinc-200 bg-white">
       <button
         onClick={handleCopy}
         type="button"
-        className="absolute top-2 right-2 rounded-md bg-zinc-800 px-2 py-1 text-[11px] text-zinc-300 hover:text-white"
+        className="absolute right-3 top-3 rounded-md border border-zinc-200 bg-white px-2 py-1 text-[11px] font-medium text-zinc-600 shadow-sm hover:text-zinc-900"
       >
         {copied ? 'Copied!' : 'Copy'}
       </button>
-      <pre className="max-h-96 overflow-auto p-4 text-[12px] leading-relaxed text-zinc-300">
+      <pre className="h-full overflow-auto p-4 text-[12px] leading-relaxed text-zinc-700">
         <code>{svg}</code>
       </pre>
     </div>

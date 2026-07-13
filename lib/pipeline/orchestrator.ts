@@ -58,8 +58,10 @@ export async function runPipeline(
     store.clearBuffer(jobId, 'original');
     store.clearBuffer(jobId, 'posterized');
 
-    // ── Stage 4: Repair ───────────────────────────────────────────
-    progress('repairing', 0, 'Sending to Gemini…');
+    // ── Stage 4: Structure ────────────────────────────────────────
+    // Code-based SVG structurer: groups paths by fill, assigns IDs,
+    // removes empty/duplicate/background-flood paths. No LLM call.
+    progress('repairing', 0, 'Structuring SVG…');
     const repaired = await repair(
       {
         svgRaw: traced.svgRaw,
@@ -71,10 +73,10 @@ export async function runPipeline(
       signal,
     );
 
-    progress('repairing', 90, 'Validating Gemini output…');
+    progress('repairing', 90, 'Validating output…');
     const validation = validateSVG(repaired.svgRepaired);
     if (!validation.valid) {
-      throw new StageError('repairing', `Invalid SVG from Gemini: ${validation.errors.join(', ')}`);
+      throw new StageError('repairing', `Invalid SVG after structuring: ${validation.errors.join(', ')}`);
     }
     store.update(jobId, 'repairing', { status: 'completed', subProgress: 100, subStatus: 'Done' });
 

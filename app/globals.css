@@ -1,10 +1,14 @@
 @import 'tailwindcss';
 
+@theme inline {
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
 :root {
-  --background: #0a0a0b;
-  --foreground: #f4f4f5;
-  --accent: #6366f1;
-  --border: #27272a;
+  --background: #ffffff;
+  --foreground: #18181b;
+  --accent: #18181b;
+  --border: #e4e4e7;
 }
 
 * {
@@ -14,5 +18,22 @@
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+/* Transparency-canvas checkerboard, used behind the vector/raster artboard
+ * in the Vector Studio workspace. Classic two-gradient trick, not an image
+ * asset, so it scales/tiles for free at any viewport size. */
+.checkerboard {
+  background-color: #fafafa;
+  background-image:
+    linear-gradient(45deg, #ececef 25%, transparent 25%),
+    linear-gradient(-45deg, #ececef 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #ececef 75%),
+    linear-gradient(-45deg, transparent 75%, #ececef 75%);
+  background-size: 20px 20px;
+  background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+}
+
+textarea {
+  font-family: inherit;
 }

@@ -25,6 +25,16 @@
       "static/chunks/webpack.js",
       "static/chunks/main-app.js",
       "static/chunks/app/api/process/[jobId]/status/route.js"
+    ],
+    "/api/process/[jobId]/result/route": [
+      "static/chunks/webpack.js",
+      "static/chunks/main-app.js",
+      "static/chunks/app/api/process/[jobId]/result/route.js"
+    ],
+    "/api/edit/route": [
+      "static/chunks/webpack.js",
+      "static/chunks/main-app.js",
+      "static/chunks/app/api/edit/route.js"
     ]
   }
 }

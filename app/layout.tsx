@@ -1,16 +1,19 @@
 import type { Metadata } from 'next';
+import { Inter } from 'next/font/google';
 import './globals.css';
 
+const inter = Inter({ subsets: ['latin'], variable: '--font-inter' });
+
 export const metadata: Metadata = {
-  title: 'Curvia — Image to Editable SVG',
+  title: 'Curvia — Vector Studio',
   description:
-    'Upload a raster image and get back a clean, structured, editable SVG — posterize, trace, and semantic repair in one pipeline.',
+    'Generate from a description or trace an image into clean, editable vector paths.',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
-      <body>{children}</body>
+    <html lang="en" className={inter.variable}>
+      <body className="font-sans antialiased">{children}</body>
     </html>
   );
 }

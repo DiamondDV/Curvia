@@ -1,159 +1,286 @@
-import type { ImageAnalysis, RepairInput, RepairOutput } from '@/types/stages';
+import type { RepairInput, RepairOutput } from '@/types/stages';
 import type { GeminiClient } from '@/lib/ai/gemini';
-import { REPAIR_PROMPT } from '@/lib/config/prompts';
 import { StageError } from '@/lib/utils/errors';
-import { limits } from '@/lib/config/limits';
 import { logger } from '@/lib/pipeline/logger';
+import { parseXml, type XmlNode, type XmlElement, type XmlText } from '@rgrove/parse-xml';
 
-// This is the stage that replaces OpenCV + GPT-Image from the previous plan.
-// Gemini reads the raw SVG text and the original image, then produces a
-// cleaned SVG with proper semantic structure.
+// ─── Code-based SVG Structurer ────────────────────────────────────────────
+//
+// Previously this stage called Gemini to re-emit the entire SVG with minor
+// structural additions. That was architecturally wrong: an LLM is a poor
+// tool for verbatim XML restructuring — high latency, high token cost, and
+// truncation failures on any SVG larger than ~80KB because every path
+// coordinate had to be re-emitted as output tokens just to add <g> wrappers.
+//
+// This replaces that with a deterministic code transform using the same
+// @rgrove/parse-xml parser already used in lib/svg/validator.ts:
+//
+//  1. Parse → typed AST
+//  2. Remove zero-area / empty paths
+//  3. Remove exact-duplicate paths (identical d= strings)
+//  4. Remove background-flood paths (fills palette[0], covers >80% viewBox)
+//  5. Group <path> elements by fill color → <g id="color-N"> + <title>
+//  6. Assign sequential path-N IDs
+//  7. Rebuild well-formed SVG string with xmlns + viewBox preserved exactly
+//
+// No LLM call. No token budget. Runs in <5ms on any SVG size.
+// GeminiClient is kept in the signature so the orchestrator doesn't need
+// to change, but it is never called here.
+
 export async function repair(
   input: RepairInput,
-  gemini: GeminiClient,
-  signal: AbortSignal,
+  _gemini: GeminiClient,
+  _signal: AbortSignal,
 ): Promise<RepairOutput> {
-  const { svgRaw, originalPngBuffer, palette, analysis } = input;
+  const { svgRaw, palette } = input;
 
-  // Edge case from plan.md: an unusually complex raw SVG could approach
-  // Gemini's practical context budget. Skip repair rather than risk a
-  // truncated or failed response — SVGO still runs afterward.
-  if (Buffer.byteLength(svgRaw, 'utf8') > limits.MAX_REPAIR_INPUT_BYTES) {
+  try {
+    const result = structureSVG(svgRaw, palette);
+    logger.info('SVG structured', {
+      inputPaths: result.stats.inputPaths,
+      outputPaths: result.stats.outputPaths,
+      removed: result.stats.removed,
+      groups: result.stats.groups,
+    });
+    return {
+      svgRepaired: result.svg,
+      changesSummary: result.summary,
+    };
+  } catch (err) {
+    // If our parser chokes on malformed input, pass the raw SVG through
+    // unchanged — SVGO will still run and may be able to handle it.
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn('SVG structuring failed — passing raw SVG through', { error: msg });
     return {
       svgRepaired: svgRaw,
-      changesSummary: 'Skipped: raw SVG exceeded repair size threshold',
+      changesSummary: `Structuring skipped (parse error): ${msg}`,
     };
   }
+}
 
-  // Gemini 2.5 Flash has a 1M token context window.
-  // Raw SVG from a posterized image is typically 20-200KB.
-  // Fits easily. No chunking needed.
-  const prompt = buildPrompt(svgRaw, palette, analysis);
+// ─── Types ────────────────────────────────────────────────────────────────
 
-  const response = await gemini.generateContent(
-    {
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            // Original image for visual reference
-            {
-              inlineData: {
-                mimeType: 'image/png',
-                data: originalPngBuffer.toString('base64'),
-              },
-            },
-            // The raw SVG to repair
-            { text: prompt },
-          ],
-        },
-      ],
-    },
-    signal,
+interface StructureResult {
+  svg: string;
+  summary: string;
+  stats: {
+    inputPaths: number;
+    outputPaths: number;
+    removed: number;
+    groups: number;
+  };
+}
+
+interface PathInfo {
+  d: string;
+  fill: string;
+  attrs: Record<string, string>; // all attributes except id, d, fill
+}
+
+// ─── Main transform ───────────────────────────────────────────────────────
+
+function structureSVG(svgRaw: string, palette: string[]): StructureResult {
+  // Parse
+  let doc;
+  try {
+    doc = parseXml(svgRaw);
+  } catch (e) {
+    throw new StageError('repairing', `XML parse failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  const root = doc.children.find(
+    (n): n is XmlElement => n.type === 'element' && (n as XmlElement).name === 'svg',
   );
+  if (!root) throw new StageError('repairing', 'No <svg> root element found');
 
-  const candidate = response.candidates?.[0];
-  const finishReason = candidate?.finishReason;
-  const responseText = candidate?.content?.parts?.[0]?.text;
+  // Preserve root attributes exactly (viewBox, xmlns, width, height, etc.)
+  const rootAttrs: Record<string, string> = { ...(root.attributes ?? {}) };
+  // Ensure xmlns is present
+  if (!rootAttrs['xmlns']) rootAttrs['xmlns'] = 'http://www.w3.org/2000/svg';
 
-  if (response.promptFeedback?.blockReason) {
-    throw new StageError(
-      'repairing',
-      `Gemini blocked the request: ${response.promptFeedback.blockReason}`,
-    );
-  }
+  // Parse viewBox for background-flood detection
+  const viewBox = rootAttrs['viewBox'];
+  const vb = viewBox ? parseViewBox(viewBox) : null;
 
-  if (!responseText) {
-    throw new StageError(
-      'repairing',
-      `Gemini returned empty response (finishReason: ${finishReason ?? 'unknown'})`,
-    );
-  }
+  // Collect all <path> elements from anywhere in the tree (VTracer emits
+  // a flat list; nesting level doesn't matter here)
+  const allPaths = collectPaths(root);
+  const inputPaths = allPaths.length;
 
-  if (finishReason === 'MAX_TOKENS') {
-    logger.warn('Gemini response truncated at MAX_TOKENS', {
-      responseLength: responseText.length,
-      preview: responseText.slice(-300),
-    });
-    throw new StageError(
-      'repairing',
-      'Gemini response was truncated (hit MAX_TOKENS) before finishing the SVG. ' +
-        'Try again, or reduce color count to shrink the raw SVG.',
-    );
-  }
+  // ── Step 1: remove zero-area / empty paths ────────────────────────────
+  const nonEmpty = allPaths.filter((p) => !isEmptyPath(p.d));
 
-  // Extract SVG from response (Gemini may wrap it in markdown)
-  const svgRepaired = ensureNamespacesDeclared(extractSVG(responseText));
-  const changesSummary = extractSummary(responseText);
-
-  return { svgRepaired, changesSummary };
-}
-
-function buildPrompt(svgRaw: string, palette: string[], analysis: ImageAnalysis): string {
-  return `${REPAIR_PROMPT}
-
-PALETTE (${palette.length} colors): ${palette.join(', ')}
-DIMENSIONS: ${analysis.normalizedWidth}×${analysis.normalizedHeight}
-HAS TRANSPARENCY: ${analysis.hasTransparency}
-
-RAW SVG TO REPAIR:
-\`\`\`svg
-${svgRaw}
-\`\`\`
-
-Return ONLY the repaired SVG, then on a new line write:
-CHANGES: <one-line summary of what you changed>`;
-}
-
-function extractSVG(text: string): string {
-  // Try fenced code block first
-  const fenced = text.match(/```(?:svg|xml)?\n([\s\S]+?)\n```/);
-  if (fenced) return fenced[1]!.trim();
-
-  // Try raw SVG element
-  const raw = text.match(/<svg[\s\S]+<\/svg>/);
-  if (raw) return raw[0].trim();
-
-  // Nothing matched — log a preview so this is diagnosable instead of a
-  // bare "could not extract" with no clue what Gemini actually sent back.
-  logger.error('Could not extract SVG from Gemini response', {
-    responseLength: text.length,
-    preview: text.slice(0, 500),
+  // ── Step 2: remove exact duplicates (same d= string) ─────────────────
+  const seen = new Set<string>();
+  const deduplicated = nonEmpty.filter((p) => {
+    if (seen.has(p.d)) return false;
+    seen.add(p.d);
+    return true;
   });
 
-  throw new StageError('repairing', 'Could not extract SVG from Gemini response');
+  // ── Step 3: remove background-flood paths ────────────────────────────
+  // A path whose fill matches the first palette color (the background) and
+  // whose bounding box covers >80% of the viewBox area is almost certainly
+  // a solid background rectangle — removing it produces a cleaner SVG.
+  const bgColor = palette[0] ? normalizeHex(palette[0]) : null;
+  const filtered = deduplicated.filter((p) => {
+    if (!bgColor || !vb) return true;
+    if (normalizeHex(p.fill) !== bgColor) return true;
+    // Cheap bounding-box estimate from path bounds
+    const bounds = estimatePathBounds(p.d, vb);
+    if (!bounds) return true;
+    const pathArea = bounds.w * bounds.h;
+    const vbArea = vb.w * vb.h;
+    return vbArea === 0 || pathArea / vbArea <= 0.80;
+  });
+
+  const removed = inputPaths - filtered.length;
+
+  // ── Step 4: group by fill ─────────────────────────────────────────────
+  const groups = new Map<string, PathInfo[]>();
+  for (const p of filtered) {
+    const key = normalizeHex(p.fill) || 'no-fill';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(p);
+  }
+
+  // ── Step 5: build output SVG ──────────────────────────────────────────
+  let pathIndex = 0;
+  let groupIndex = 0;
+  const groupBlocks: string[] = [];
+
+  for (const [fillKey, paths] of groups) {
+    groupIndex++;
+    const pathEls = paths.map((p) => {
+      pathIndex++;
+      const id = `path-${pathIndex}`;
+      const extraAttrs = Object.entries(p.attrs)
+        .map(([k, v]) => `${k}="${escapeXml(v)}"`)
+        .join(' ');
+      const extraStr = extraAttrs ? ` ${extraAttrs}` : '';
+      return `    <path id="${id}" fill="${escapeXml(p.fill)}" d="${escapeXml(p.d)}"${extraStr}/>`;
+    });
+
+    const label = fillKey === 'no-fill' ? 'unfilled' : fillKey;
+    const block = [
+      `  <g id="color-${groupIndex}">`,
+      `    <title>${escapeXml(label)}</title>`,
+      ...pathEls,
+      `  </g>`,
+    ].join('\n');
+    groupBlocks.push(block);
+  }
+
+  const rootAttrStr = Object.entries(rootAttrs)
+    .map(([k, v]) => `${k}="${escapeXml(v)}"`)
+    .join(' ');
+
+  const svgOut = [
+    `<svg ${rootAttrStr}>`,
+    ...groupBlocks,
+    `</svg>`,
+  ].join('\n');
+
+  const summary =
+    `Structured: ${inputPaths} paths in → ${pathIndex} paths out ` +
+    `(${removed} removed, ${groupIndex} color groups)`;
+
+  return {
+    svg: svgOut,
+    summary,
+    stats: { inputPaths, outputPaths: pathIndex, removed, groups: groupIndex },
+  };
 }
 
-// Known prefix -> namespace URI for attribute prefixes the repair prompt
-// asks Gemini to use. The prompt instructs it to also declare these on
-// the root <svg>, but LLM output isn't 100% reliable — this is a safety
-// net so a forgotten xmlns:inkscape doesn't fail strict XML parsing in
-// validateSVG() (mirrors trace.ts's ensureViewBox() pattern).
-const KNOWN_NAMESPACES: Record<string, string> = {
-  inkscape: 'http://www.inkscape.org/namespaces/inkscape',
-  sodipodi: 'http://sodipodi.sourceforge.net/DTD/sodipodi-0.0.dtd',
-};
+// ─── Helpers ──────────────────────────────────────────────────────────────
 
-function ensureNamespacesDeclared(svg: string): string {
-  const rootMatch = svg.match(/<svg\b[^>]*>/);
-  if (!rootMatch) return svg;
-  const rootTag = rootMatch[0];
-
-  const missing = Object.entries(KNOWN_NAMESPACES).filter(
-    ([prefix]) =>
-      new RegExp(`\\b${prefix}:`).test(svg) &&
-      !new RegExp(`\\bxmlns:${prefix}\\s*=`).test(rootTag),
-  );
-
-  if (missing.length === 0) return svg;
-
-  const declarations = missing.map(([prefix, uri]) => `xmlns:${prefix}="${uri}"`).join(' ');
-  const patchedRootTag = rootTag.replace(/^<svg\b/, `<svg ${declarations}`);
-
-  return svg.replace(rootTag, patchedRootTag);
+function isElement(node: XmlNode): node is XmlElement {
+  return node.type === 'element';
 }
 
-function extractSummary(text: string): string {
-  const match = text.match(/CHANGES:\s*(.+)/);
-  return match?.[1]?.trim() ?? 'No summary provided';
+/** Recursively collect all <path> elements, extracting their key attributes. */
+function collectPaths(node: XmlElement): PathInfo[] {
+  const results: PathInfo[] = [];
+
+  function walk(n: XmlNode): void {
+    if (!isElement(n)) return;
+    if (n.name === 'path') {
+      const attrs = { ...(n.attributes ?? {}) };
+      const d = attrs['d'] ?? '';
+      const fill = attrs['fill'] ?? 'black';
+      // Everything except d and fill goes into extra attrs (e.g. opacity)
+      delete attrs['d'];
+      delete attrs['fill'];
+      delete attrs['id']; // IDs will be reassigned
+      results.push({ d, fill, attrs });
+    }
+    n.children.forEach(walk);
+  }
+
+  walk(node);
+  return results;
+}
+
+/** A path is empty/zero-area if its d string is blank, a bare M command, or M0 0. */
+function isEmptyPath(d: string): boolean {
+  const trimmed = d.trim();
+  if (!trimmed) return true;
+  // Only a moveto with no drawing commands
+  if (/^[Mm]\s*[\d.,\s-]+$/.test(trimmed)) return true;
+  // Degenerate M0 0 or M 0,0
+  if (/^[Mm]\s*0[,\s]+0\s*$/.test(trimmed)) return true;
+  return false;
+}
+
+interface ViewBox { x: number; y: number; w: number; h: number }
+
+function parseViewBox(vb: string): ViewBox | null {
+  const parts = vb.trim().split(/[\s,]+/).map(Number);
+  if (parts.length !== 4 || parts.some(isNaN)) return null;
+  return { x: parts[0]!, y: parts[1]!, w: parts[2]!, h: parts[3]! };
+}
+
+/** Very cheap bounding-box estimate: scan M/L/C/Q/A coordinate pairs for min/max. */
+function estimatePathBounds(d: string, vb: ViewBox): { w: number; h: number } | null {
+  // Extract all numbers from the d string
+  const nums = (d.match(/-?[\d.]+(?:e[+-]?\d+)?/gi) ?? []).map(Number).filter((n) => !isNaN(n));
+  if (nums.length < 2) return null;
+
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  // Treat pairs as x,y coordinate candidates (rough approximation)
+  for (let i = 0; i + 1 < nums.length; i += 2) {
+    const x = nums[i]!;
+    const y = nums[i + 1]!;
+    // Clamp to reasonable range relative to viewBox to skip arc flags etc.
+    if (x < vb.x - vb.w || x > vb.x + vb.w * 2) continue;
+    if (y < vb.y - vb.h || y > vb.y + vb.h * 2) continue;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+
+  if (!isFinite(minX)) return null;
+  return { w: maxX - minX, h: maxY - minY };
+}
+
+/** Normalize hex to lowercase 6-digit form for comparison. */
+function normalizeHex(color: string): string {
+  if (!color) return '';
+  const c = color.trim().toLowerCase();
+  // Expand shorthand #abc → #aabbcc
+  if (/^#[0-9a-f]{3}$/.test(c)) {
+    return `#${c[1]}${c[1]}${c[2]}${c[2]}${c[3]}${c[3]}`;
+  }
+  return c;
+}
+
+/** Escape the five XML special characters for attribute values and text. */
+function escapeXml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
